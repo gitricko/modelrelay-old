@@ -226,7 +226,7 @@ Example:
   - `GOOGLE_API_KEY`
 
 Kiro OAuth notes:
-- Base endpoint is preconfigured to `https://runtime.us-east-1.kiro.dev/v1/chat/completions`
+- Base endpoint is preconfigured to `https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse`
 - Current Kiro model IDs include `claude-sonnet-4.5` and `claude-haiku-4.5`
 - Authentication uses OAuth access tokens refreshed from:
   - `KIRO_REFRESH_TOKEN`, or
