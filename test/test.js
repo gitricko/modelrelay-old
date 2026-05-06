@@ -446,6 +446,56 @@ describe('provider api key resolution', () => {
     }
   })
 
+  it('uses rotated refresh token for subsequent cache-miss refreshes', async () => {
+    const originalRefreshToken = process.env.KIRO_REFRESH_TOKEN
+    const originalClientId = process.env.KIRO_OAUTH_CLIENT_ID
+    const originalClientSecret = process.env.KIRO_OAUTH_CLIENT_SECRET
+    const originalFetch = globalThis.fetch
+    const initialToken = 'aorAAAAAG-initial-refresh-token'
+    const rotatedToken = 'aorAAAAAG-rotated-refresh-token'
+
+    process.env.KIRO_REFRESH_TOKEN = initialToken
+    delete process.env.KIRO_OAUTH_CLIENT_ID
+    delete process.env.KIRO_OAUTH_CLIENT_SECRET
+
+    let callCount = 0
+    const tokensReceived = []
+    // expiresIn: 1 puts the expiry inside the 60-second skew window so the cache immediately misses on the next call
+    globalThis.fetch = async (url, init) => {
+      callCount += 1
+      const body = JSON.parse(String(init?.body || '{}'))
+      tokensReceived.push(body.refreshToken)
+      return new Response(JSON.stringify({
+        accessToken: `oauth-access-token-${callCount}`,
+        refreshToken: rotatedToken,
+        expiresIn: 1,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } })
+    }
+
+    try {
+      // First call: cache miss → fetch with initialToken → response includes rotatedToken
+      const tokenA = await resolveKiroOAuthAccessToken({ providers: {} })
+      assert.equal(tokenA, 'oauth-access-token-1')
+      assert.equal(tokensReceived[0], initialToken)
+      assert.equal(callCount, 1)
+
+      // Second call: cache is expired (expiresIn:1 < skew), but sourceRefreshToken matches
+      // so effectiveRefreshToken should be the rotated token, not the original
+      const tokenB = await resolveKiroOAuthAccessToken({ providers: {} })
+      assert.equal(tokenB, 'oauth-access-token-2')
+      assert.equal(tokensReceived[1], rotatedToken)
+      assert.equal(callCount, 2)
+    } finally {
+      globalThis.fetch = originalFetch
+      if (originalRefreshToken === undefined) delete process.env.KIRO_REFRESH_TOKEN
+      else process.env.KIRO_REFRESH_TOKEN = originalRefreshToken
+      if (originalClientId === undefined) delete process.env.KIRO_OAUTH_CLIENT_ID
+      else process.env.KIRO_OAUTH_CLIENT_ID = originalClientId
+      if (originalClientSecret === undefined) delete process.env.KIRO_OAUTH_CLIENT_SECRET
+      else process.env.KIRO_OAUTH_CLIENT_SECRET = originalClientSecret
+    }
+  })
+
   it('builds Kiro browser OAuth URLs for Google and GitHub', () => {
     const googleUrl = new URL(buildKiroSocialLoginUrl('google', 'challenge-google', 'state-google'))
     assert.equal(`${googleUrl.origin}${googleUrl.pathname}`, 'https://prod.us-east-1.auth.desktop.kiro.dev/login')
