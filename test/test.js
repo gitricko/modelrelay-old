@@ -13,6 +13,7 @@ import {
   sortResults,
   findBestModel,
   rankModelsForRouting,
+  getRoutingModelKey,
   buildModelGroups,
   filterModelsByRequested,
   isRetryableProxyStatus,
@@ -24,9 +25,9 @@ import {
 import { buildOpenClawProviderConfig } from '../lib/onboard.js'
 import { normalizeMissingScoreId } from '../lib/score-fetcher.js'
 import { resolveAutostartExecPath, resolveAutostartNodePath } from '../lib/autostart.js'
-import { exportConfigToken, getApiKey, getApiKeyPool, getMaxTurns, getPinningMode, getProviderBaseUrl, getProviderModelId, getProviderPingIntervalMs, hasMultipleKeys, importConfigToken, normalizeConfigShape } from '../lib/config.js'
+import { exportConfigToken, getApiKey, getApiKeyPool, getMaxTurns, getPinningMode, getProviderBaseUrl, getProviderModelId, getProviderPingIntervalMs, hasMultipleKeys, importConfigToken, normalizeConfigShape, isOpenAICompatibleInstanceKey, getBaseProviderKey, getOpenAICompatibleInstanceId, buildOpenAICompatibleInstanceKey, listOpenAICompatibleEndpoints, upsertOpenAICompatibleEndpoint, removeOpenAICompatibleEndpoint } from '../lib/config.js'
 import { buildNpmInstallInvocation, buildWindowsPostUpdateRestartCommand, getForcedUpdateVersion, getLocalUpdateTarballPath, getLocalUpdateVersion, isRunningFromSource, shouldStopAutostartBeforeUpdate } from '../lib/update.js'
-import { buildKiroRequestPayload, buildKiroSocialLoginUrl, buildOpencodeHeaders, buildOpencodeProjectId, buildProviderRequestBody, buildProviderRequestHeaders, exchangeKiroSocialAuthFlow, exchangeKiroSocialCode, extractKiroEmailFromAccessToken, extractOllamaModelRecords, getAccountStatus, getKiroRefreshToken, hasKiroAuthConfigured, getPinnedModelCandidate, getPinnedModelMatches, isProviderAuthOptional, isProviderBearerAuthEnabled, parseKiroEventFrame, pollKiroBuilderIdToken, providerWantsBearerAuth, resolveKiroOAuthAccessToken, shouldRetryOptionalProviderWithBearer, startKiroBuilderIdDeviceAuth, startKiroSocialAuthFlow, toOllamaModelMeta, toOpenCodeModelMeta, toOpenRouterModelMeta, toKiloCodeModelMeta, transformKiroResponse } from '../lib/server.js'
+import { buildKiroRequestPayload, buildKiroSocialLoginUrl, buildOpencodeHeaders, buildOpencodeProjectId, buildProviderRequestBody, buildProviderRequestHeaders, exchangeKiroSocialAuthFlow, exchangeKiroSocialCode, extractKiroEmailFromAccessToken, extractOllamaModelRecords, extractOpenAICompatibleModelRecords, buildOpenAICompatibleModelsListUrl, getAccountStatus, getKiroRefreshToken, hasKiroAuthConfigured, getPinnedModelCandidate, getPinnedModelMatches, isProviderAuthOptional, isProviderBearerAuthEnabled, parseKiroEventFrame, pollKiroBuilderIdToken, providerWantsBearerAuth, resolveKiroOAuthAccessToken, shouldRetryOptionalProviderWithBearer, startKiroBuilderIdDeviceAuth, startKiroSocialAuthFlow, toOllamaModelMeta, toOpenAICompatibleDiscoveredModelMeta, toOpenCodeModelMeta, toOpenRouterModelMeta, toKiloCodeModelMeta, transformKiroResponse } from '../lib/server.js'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(__dirname, '..')
 
@@ -1701,6 +1702,18 @@ describe('model grouping and filtering', () => {
     assert.equal(groups[0].id, 'minimax-m2.5')
   })
 
+  it('keeps duplicate raw model ids from different providers addressable', () => {
+    const groups = buildModelGroups([
+      mockResult({ modelId: 'llama-3.1', label: 'Llama 3.1', providerKey: 'openai-compatible:local' }),
+      mockResult({ modelId: 'llama-3.1', label: 'Llama 3.1', providerKey: 'openai-compatible:remote' }),
+    ], canonicalizeModelId)
+
+    assert.deepEqual(groups.map(group => group.id).sort(), [
+      'openai-compatible:local/llama-3.1',
+      'openai-compatible:remote/llama-3.1',
+    ])
+  })
+
   it('groups MiMo Omni aliases under one model name', () => {
     const groups = buildModelGroups([
       mockResult({ modelId: 'mimo-v2-omni-free', label: 'MiMo V2 Omni' }),
@@ -1767,6 +1780,17 @@ describe('model grouping and filtering', () => {
     const filtered = filterModelsByRequested(results, 'auto-fastest', canonicalizeModelId)
     assert.equal(filtered.length, 3)
   })
+
+  it('filters duplicate raw model ids by endpoint-qualified group id', () => {
+    const duplicateResults = [
+      mockResult({ modelId: 'llama-3.1', label: 'Llama 3.1', providerKey: 'openai-compatible:local' }),
+      mockResult({ modelId: 'llama-3.1', label: 'Llama 3.1', providerKey: 'openai-compatible:remote' }),
+    ]
+
+    const filtered = filterModelsByRequested(duplicateResults, 'openai-compatible:remote/llama-3.1', canonicalizeModelId)
+
+    assert.deepEqual(filtered.map(r => r.providerKey), ['openai-compatible:remote'])
+  })
 })
 
 describe('pinned model routing', () => {
@@ -1795,6 +1819,18 @@ describe('pinned model routing', () => {
   it('routes to the best eligible provider within a canonical pin group', () => {
     const candidate = getPinnedModelCandidate(results, 'nvidia/glm4.7', 'canonical')
     assert.equal(candidate?.modelId, 'nvidia/glm4.7')
+  })
+
+  it('can retry another provider with the same raw model id', () => {
+    const duplicateResults = [
+      mockResult({ modelId: 'llama-3.1', label: 'Llama 3.1', providerKey: 'openai-compatible:local', pings: [{ ms: 90, code: '200' }], intell: 10 }),
+      mockResult({ modelId: 'llama-3.1', label: 'Llama 3.1', providerKey: 'openai-compatible:remote', pings: [{ ms: 100, code: '200' }], intell: 10 }),
+    ]
+    const first = rankModelsForRouting(duplicateResults)[0]
+    const second = rankModelsForRouting(duplicateResults, [getRoutingModelKey(first)])[0]
+
+    assert.equal(first.providerKey, 'openai-compatible:local')
+    assert.equal(second.providerKey, 'openai-compatible:remote')
   })
 })
 
@@ -2010,5 +2046,237 @@ describe('multi-account round-robin', () => {
       assert.equal(entry.accounts.get(0).requests, 1)
       assert.equal(entry.accounts.get(1).requests, 0)
     })
+  })
+})
+
+describe('OpenAI-compatible multi-instance support', () => {
+  it('detects instance keys and extracts ids', () => {
+    assert.equal(isOpenAICompatibleInstanceKey('openai-compatible:default'), true)
+    assert.equal(isOpenAICompatibleInstanceKey('openai-compatible:my-vllm'), true)
+    assert.equal(isOpenAICompatibleInstanceKey('openai-compatible'), false)
+    assert.equal(isOpenAICompatibleInstanceKey('groq'), false)
+
+    assert.equal(getOpenAICompatibleInstanceId('openai-compatible:my-vllm'), 'my-vllm')
+    assert.equal(getOpenAICompatibleInstanceId('groq'), null)
+
+    assert.equal(getBaseProviderKey('openai-compatible:my-vllm'), 'openai-compatible')
+    assert.equal(getBaseProviderKey('groq'), 'groq')
+  })
+
+  it('builds instance keys from human-friendly names', () => {
+    assert.equal(buildOpenAICompatibleInstanceKey('My vLLM '), 'openai-compatible:my-vllm')
+    assert.equal(buildOpenAICompatibleInstanceKey('Foo Bar 123'), 'openai-compatible:foo-bar-123')
+    assert.equal(buildOpenAICompatibleInstanceKey(''), null)
+    assert.equal(buildOpenAICompatibleInstanceKey('!!!'), null)
+  })
+
+  it('normalizeConfigShape migrates a legacy bare-key config to :default', () => {
+    const legacy = {
+      apiKeys: { 'openai-compatible': 'sk-legacy' },
+      providers: { 'openai-compatible': { enabled: true, baseUrl: 'https://legacy.example/v1', modelId: 'old/model' } },
+    }
+    const normalized = normalizeConfigShape(legacy)
+    assert.equal(normalized.apiKeys['openai-compatible'], undefined)
+    assert.equal(normalized.providers['openai-compatible'], undefined)
+    assert.equal(normalized.apiKeys['openai-compatible:default'], 'sk-legacy')
+    assert.deepEqual(normalized.providers['openai-compatible:default'], {
+      enabled: true,
+      baseUrl: 'https://legacy.example/v1',
+      modelId: 'old/model',
+      name: 'Default',
+    })
+  })
+
+  it('normalizeConfigShape leaves a config without legacy entries alone', () => {
+    const cfg = {
+      apiKeys: { 'openai-compatible:my-vllm': 'sk-vllm' },
+      providers: { 'openai-compatible:my-vllm': { name: 'vLLM', baseUrl: 'http://localhost:8000/v1', modelId: 'qwen' } },
+    }
+    const normalized = normalizeConfigShape(cfg)
+    assert.equal(normalized.apiKeys['openai-compatible:my-vllm'], 'sk-vllm')
+    assert.equal(normalized.providers['openai-compatible:my-vllm'].baseUrl, 'http://localhost:8000/v1')
+    // The bare entry should not be (re)created.
+    assert.equal(normalized.apiKeys['openai-compatible'], undefined)
+    assert.equal(normalized.providers['openai-compatible'], undefined)
+  })
+
+  it('normalizeConfigShape does not clobber an existing :default instance', () => {
+    const legacy = {
+      apiKeys: {
+        'openai-compatible': 'sk-legacy',
+        'openai-compatible:default': 'sk-already-here',
+      },
+      providers: {
+        'openai-compatible': { baseUrl: 'https://legacy.example/v1' },
+        'openai-compatible:default': { name: 'Pre-existing', baseUrl: 'https://default.example/v1', modelId: 'm' },
+      },
+    }
+    const normalized = normalizeConfigShape(legacy)
+    assert.equal(normalized.apiKeys['openai-compatible:default'], 'sk-already-here')
+    assert.equal(normalized.providers['openai-compatible:default'].name, 'Pre-existing')
+    assert.equal(normalized.apiKeys['openai-compatible'], undefined)
+    assert.equal(normalized.providers['openai-compatible'], undefined)
+  })
+
+  it('legacy OPENAI_COMPATIBLE_* env vars feed the :default instance', () => {
+    const originalKey = process.env.OPENAI_COMPATIBLE_API_KEY
+    const originalBaseUrl = process.env.OPENAI_COMPATIBLE_BASE_URL
+    const originalModel = process.env.OPENAI_COMPATIBLE_MODEL
+
+    try {
+      process.env.OPENAI_COMPATIBLE_API_KEY = 'env-key'
+      process.env.OPENAI_COMPATIBLE_BASE_URL = 'https://env.example/v1'
+      process.env.OPENAI_COMPATIBLE_MODEL = 'env/model'
+
+      const config = { apiKeys: {}, providers: {} }
+      assert.equal(getApiKey(config, 'openai-compatible:default'), 'env-key')
+      assert.equal(getProviderBaseUrl(config, 'openai-compatible:default'), 'https://env.example/v1')
+      assert.equal(getProviderModelId(config, 'openai-compatible:default'), 'env/model')
+
+      // Env vars should NOT apply to a non-default instance.
+      assert.equal(getApiKey(config, 'openai-compatible:other'), null)
+      assert.equal(getProviderBaseUrl(config, 'openai-compatible:other'), null)
+    } finally {
+      if (originalKey == null) delete process.env.OPENAI_COMPATIBLE_API_KEY
+      else process.env.OPENAI_COMPATIBLE_API_KEY = originalKey
+      if (originalBaseUrl == null) delete process.env.OPENAI_COMPATIBLE_BASE_URL
+      else process.env.OPENAI_COMPATIBLE_BASE_URL = originalBaseUrl
+      if (originalModel == null) delete process.env.OPENAI_COMPATIBLE_MODEL
+      else process.env.OPENAI_COMPATIBLE_MODEL = originalModel
+    }
+  })
+
+  it('listOpenAICompatibleEndpoints returns instances in stable insertion order', () => {
+    const config = normalizeConfigShape({
+      apiKeys: {
+        'openai-compatible:alpha': 'sk-a',
+        'openai-compatible:beta': 'sk-b',
+      },
+      providers: {
+        'openai-compatible:alpha': { name: 'Alpha', baseUrl: 'https://a/v1', modelId: 'a-model' },
+        'openai-compatible:beta':  { name: 'Beta',  baseUrl: 'https://b/v1', modelId: 'b-model', enabled: false },
+      },
+    })
+
+    const list = listOpenAICompatibleEndpoints(config)
+    assert.equal(list.length, 2)
+    assert.equal(list[0].instanceKey, 'openai-compatible:alpha')
+    assert.equal(list[0].id, 'alpha')
+    assert.equal(list[0].name, 'Alpha')
+    assert.equal(list[0].baseUrl, 'https://a/v1')
+    assert.equal(list[0].modelId, 'a-model')
+    assert.equal(list[0].apiKey, 'sk-a')
+    assert.equal(list[0].enabled, true)
+
+    assert.equal(list[1].instanceKey, 'openai-compatible:beta')
+    assert.equal(list[1].enabled, false)
+  })
+
+  it('upsertOpenAICompatibleEndpoint and remove round-trip cleanly', () => {
+    const config = { apiKeys: {}, providers: {} }
+    const key1 = upsertOpenAICompatibleEndpoint(config, { id: 'one', name: 'One', baseUrl: 'https://one/v1', modelId: 'm1', apiKey: 'sk-1' })
+    assert.equal(key1, 'openai-compatible:one')
+    assert.equal(config.apiKeys[key1], 'sk-1')
+    assert.equal(config.providers[key1].baseUrl, 'https://one/v1')
+    assert.equal(config.providers[key1].name, 'One')
+
+    // Update preserves untouched fields.
+    upsertOpenAICompatibleEndpoint(config, { instanceKey: key1, modelId: 'm1-new' })
+    assert.equal(config.providers[key1].baseUrl, 'https://one/v1')
+    assert.equal(config.providers[key1].modelId, 'm1-new')
+
+    const removed = removeOpenAICompatibleEndpoint(config, key1)
+    assert.equal(removed, true)
+    assert.equal(config.apiKeys[key1], undefined)
+    assert.equal(config.providers[key1], undefined)
+
+    // Removing again is a no-op.
+    assert.equal(removeOpenAICompatibleEndpoint(config, key1), false)
+    // Refusing to remove a non-instance key.
+    assert.equal(removeOpenAICompatibleEndpoint(config, 'groq'), false)
+  })
+
+  it('upsertOpenAICompatibleEndpoint persists discoverModels=false explicitly', () => {
+    const config = { apiKeys: {}, providers: {} }
+    upsertOpenAICompatibleEndpoint(config, { id: 'one', name: 'One', baseUrl: 'http://h/v1' })
+    assert.equal(config.providers['openai-compatible:one'].discoverModels, undefined)
+
+    upsertOpenAICompatibleEndpoint(config, { instanceKey: 'openai-compatible:one', discoverModels: false })
+    assert.equal(config.providers['openai-compatible:one'].discoverModels, false)
+
+    upsertOpenAICompatibleEndpoint(config, { instanceKey: 'openai-compatible:one', discoverModels: true })
+    assert.equal('discoverModels' in config.providers['openai-compatible:one'], false)
+  })
+
+  it('config export/import preserves multi-instance shape', () => {
+    const original = normalizeConfigShape({
+      apiKeys: {
+        'openai-compatible:alpha': 'sk-a',
+        'openai-compatible:beta': 'sk-b',
+      },
+      providers: {
+        'openai-compatible:alpha': { name: 'Alpha', baseUrl: 'https://a/v1', modelId: 'a-model' },
+        'openai-compatible:beta':  { name: 'Beta',  baseUrl: 'https://b/v1', modelId: 'b-model' },
+      },
+    })
+
+    const token = exportConfigToken(original)
+    const reimported = importConfigToken(token)
+
+    assert.equal(reimported.apiKeys['openai-compatible:alpha'], 'sk-a')
+    assert.equal(reimported.apiKeys['openai-compatible:beta'], 'sk-b')
+    assert.equal(reimported.providers['openai-compatible:alpha'].name, 'Alpha')
+    assert.equal(reimported.providers['openai-compatible:beta'].modelId, 'b-model')
+  })
+})
+
+describe('OpenAI-compatible model discovery', () => {
+  it('builds the /v1/models URL from a variety of base URLs', () => {
+    assert.equal(buildOpenAICompatibleModelsListUrl('https://api.example.com'), 'https://api.example.com/v1/models')
+    assert.equal(buildOpenAICompatibleModelsListUrl('https://api.example.com/'), 'https://api.example.com/v1/models')
+    assert.equal(buildOpenAICompatibleModelsListUrl('https://api.example.com/v1'), 'https://api.example.com/v1/models')
+    assert.equal(buildOpenAICompatibleModelsListUrl('https://api.example.com/v1/'), 'https://api.example.com/v1/models')
+    assert.equal(buildOpenAICompatibleModelsListUrl('https://api.example.com/v1/chat/completions'), 'https://api.example.com/v1/models')
+    assert.equal(buildOpenAICompatibleModelsListUrl('https://api.example.com/v1/models'), 'https://api.example.com/v1/models')
+    assert.equal(buildOpenAICompatibleModelsListUrl('api.example.com/v1'), 'https://api.example.com/v1/models')
+    assert.equal(buildOpenAICompatibleModelsListUrl(''), null)
+    assert.equal(buildOpenAICompatibleModelsListUrl(null), null)
+  })
+
+  it('extracts records from common payload shapes', () => {
+    assert.deepEqual(extractOpenAICompatibleModelRecords({ data: [{ id: 'a' }, { id: 'b' }] }), [{ id: 'a' }, { id: 'b' }])
+    assert.deepEqual(extractOpenAICompatibleModelRecords({ models: [{ id: 'a' }] }), [{ id: 'a' }])
+    assert.deepEqual(extractOpenAICompatibleModelRecords([{ id: 'a' }]), [{ id: 'a' }])
+    assert.deepEqual(extractOpenAICompatibleModelRecords({}), [])
+    assert.deepEqual(extractOpenAICompatibleModelRecords(null), [])
+  })
+
+  it('converts a discovered record to a model-meta tagged with the instance key', () => {
+    const meta = toOpenAICompatibleDiscoveredModelMeta(
+      { id: 'qwen2.5-coder:7b', context_length: 32768, name: 'Qwen2.5 Coder 7B' },
+      'openai-compatible:my-vllm',
+      'https://host/v1/chat/completions',
+    )
+    assert.ok(meta)
+    assert.equal(meta.modelId, 'qwen2.5-coder:7b')
+    assert.equal(meta.label, 'Qwen2.5 Coder 7B')
+    assert.equal(meta.providerKey, 'openai-compatible:my-vllm')
+    assert.equal(meta.providerUrl, 'https://host/v1/chat/completions')
+    // 32768 → "33k" via the shared parser
+    assert.equal(meta.ctx, '33k')
+  })
+
+  it('falls back to a synthesized label when the record has none', () => {
+    const meta = toOpenAICompatibleDiscoveredModelMeta({ id: 'some_unknown-model' }, 'openai-compatible:x')
+    assert.ok(meta)
+    assert.equal(meta.modelId, 'some_unknown-model')
+    assert.equal(meta.label, 'Some Unknown Model')
+    assert.equal(meta.isEstimatedScore, true)
+  })
+
+  it('rejects records without a usable id', () => {
+    assert.equal(toOpenAICompatibleDiscoveredModelMeta({}, 'openai-compatible:x'), null)
+    assert.equal(toOpenAICompatibleDiscoveredModelMeta({ id: '   ' }, 'openai-compatible:x'), null)
+    assert.equal(toOpenAICompatibleDiscoveredModelMeta('', 'openai-compatible:x'), null)
   })
 })
