@@ -3679,6 +3679,17 @@
         const container = document.getElementById('providers-container');
         container.innerHTML = '';
 
+        const addEndpointSection = document.createElement('div');
+        addEndpointSection.className = 'provider-section';
+        addEndpointSection.innerHTML = `
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
+            <h3 style="margin:0; font-size:1rem;">OpenAI-Compatible endpoints</h3>
+            <button onclick="addOpenAICompatibleEndpoint()" style="border:1px solid var(--status-success-border); background:var(--status-success-bg); color:var(--status-success-text); cursor:pointer; padding:6px 12px; border-radius:6px; font-size:0.8rem; font-weight:600;">+ Add Endpoint</button>
+          </div>
+          <div style="font-size:0.78rem; color:var(--text-muted);">Configure one or more upstream OpenAI-compatible endpoints (vLLM, llama.cpp, custom relays, etc.). Each endpoint exposes a single model id.</div>
+        `;
+        container.appendChild(addEndpointSection);
+
         providers.sort((a, b) => {
           if (a.hasKey && !b.hasKey) return -1;
           if (!a.hasKey && b.hasKey) return 1;
@@ -3753,14 +3764,30 @@
               </div>`;
           }
 
-          const openAiCompatibleFieldsHtml = (p.key === 'openai-compatible' || p.key === 'ollama') ? `
+          const showsBaseUrlFields = p.isOpenAICompatibleInstance || p.key === 'ollama';
+          const baseUrlPlaceholder = p.key === 'ollama' ? 'https://ollama.com/v1' : 'https://your-endpoint.example/v1';
+          const baseUrlNote = p.isOpenAICompatibleInstance
+            ? 'Set the upstream base URL for this endpoint. The model id below is optional — leave blank if discovery returns the models you need.'
+            : 'Set the upstream base URL and exact model ID for this provider. If base URL is blank, modelrelay uses https://ollama.com/v1 and expects an OLLAMA_API_KEY.';
+          const openAiCompatibleFieldsHtml = showsBaseUrlFields ? `
             <div class="form-group" style="display:flex; gap:8px; align-items:center; margin-top:8px;">
-              <input type="text" id="base-url-${p.key}" value="${escapeHtml(p.baseUrl || '')}" placeholder="${p.key === 'ollama' ? 'https://ollama.com/v1' : 'https://your-endpoint.example/v1'}" style="flex:1;" onblur="updateProviderBaseUrl('${p.key}')">
+              <input type="text" id="base-url-${p.key}" value="${escapeHtml(p.baseUrl || '')}" placeholder="${baseUrlPlaceholder}" style="flex:1;" onblur="updateProviderBaseUrl('${p.key}')">
             </div>
             <div class="form-group" style="display:flex; gap:8px; align-items:center; margin-top:8px;">
-              <input type="text" id="model-id-${p.key}" value="${escapeHtml(p.modelId || '')}" placeholder="upstream-model-id" style="flex:1;" onblur="updateProviderModelId('${p.key}')">
+              <input type="text" id="model-id-${p.key}" value="${escapeHtml(p.modelId || '')}" placeholder="upstream-model-id (optional if discovery is on)" style="flex:1;" onblur="updateProviderModelId('${p.key}')">
             </div>
-            <div style="font-size:0.75rem; color:var(--text-muted); margin-top:4px;">Set the upstream base URL and exact model ID for this provider.${p.key === 'ollama' ? ' If base URL is blank, modelrelay uses https://ollama.com/v1 and expects an OLLAMA_API_KEY.' : ''}</div>
+            <div style="font-size:0.75rem; color:var(--text-muted); margin-top:4px;">${baseUrlNote}</div>
+            ${p.isOpenAICompatibleInstance ? `
+              <div style="margin-top:10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+                <label style="display:flex; align-items:center; gap:6px; font-size:0.8rem; cursor:pointer;">
+                  <input type="checkbox" id="discover-${p.key}" ${p.discoverModels !== false ? 'checked' : ''} onchange="updateProviderDiscoverModels('${p.key}')">
+                  Discover models from <code>/v1/models</code>
+                </label>
+              </div>
+              <div style="margin-top:10px; display:flex; justify-content:flex-end;">
+                <button onclick="removeOpenAICompatibleEndpoint('${escapeHtml(p.openAICompatibleInstanceId)}', ${JSON.stringify(p.name)})" style="border:1px solid var(--status-error-border); background:var(--status-error-bg); color:var(--status-error-text); cursor:pointer; padding:6px 12px; border-radius:6px; font-size:0.78rem; font-weight:600;">Remove Endpoint</button>
+              </div>
+            ` : ''}
           ` : '';
 
           const optionalBearerAuthHtml = (tokenOptional && p.hasKey) ? `
@@ -3994,6 +4021,51 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ providerKey: key, baseUrl })
       });
+      await fetchData();
+    }
+
+    async function addOpenAICompatibleEndpoint() {
+      const name = prompt('Endpoint name (e.g. "my-vllm")');
+      if (!name || !name.trim()) return;
+      const baseUrl = prompt('Base URL (e.g. https://your-host/v1)') || '';
+      const modelId = prompt('Upstream model id (optional — leave blank to rely on /v1/models discovery)') || '';
+      const apiKey = prompt('API key (leave blank if not required)') || '';
+      const resp = await fetch('/api/openai-compatible/endpoints', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: name.trim(), baseUrl: baseUrl.trim(), modelId: modelId.trim(), apiKey: apiKey.trim() || null })
+      });
+      if (!resp.ok) {
+        let msg = `HTTP ${resp.status}`;
+        try { const body = await resp.json(); if (body && body.error) msg = body.error; } catch {}
+        alert(`Could not add endpoint: ${msg}`);
+        return;
+      }
+      await loadSettings();
+      await fetchData();
+    }
+
+    async function updateProviderDiscoverModels(key) {
+      const cb = document.getElementById(`discover-${key}`);
+      const discoverModels = cb ? !!cb.checked : true;
+      await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ providerKey: key, discoverModels })
+      });
+      await fetchData();
+    }
+
+    async function removeOpenAICompatibleEndpoint(id, name) {
+      if (!confirm(`Remove endpoint "${name}"?`)) return;
+      const resp = await fetch(`/api/openai-compatible/endpoints/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (!resp.ok) {
+        let msg = `HTTP ${resp.status}`;
+        try { const body = await resp.json(); if (body && body.error) msg = body.error; } catch {}
+        alert(`Could not remove endpoint: ${msg}`);
+        return;
+      }
+      await loadSettings();
       await fetchData();
     }
 
@@ -4347,7 +4419,7 @@
         kiroBrowserAuthState = {
           provider,
           authUrl: data.authUrl,
-          codeVerifier: data.codeVerifier,
+          flowId: data.flowId,
           state: data.state,
         };
         await loadSettings();
@@ -4414,7 +4486,8 @@
           body: JSON.stringify({
             provider: kiroBrowserAuthState.provider,
             code,
-            codeVerifier: kiroBrowserAuthState.codeVerifier,
+            flowId: kiroBrowserAuthState.flowId,
+            state,
           })
         });
         const data = await res.json().catch(() => ({}));
